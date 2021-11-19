@@ -256,3 +256,101 @@ class BYOL(nn.Module):
 
         loss = loss_one + loss_two
         return loss.mean()
+
+    
+class BYOL_RGB_Flow(nn.Module):
+    def __init__(
+        self,
+        net_rgb,
+        net_flow,
+        image_size=224,
+        hidden_layer = -2,
+        projection_size = 512,
+        projection_hidden_size = 4096,
+        moving_average_decay = 0.99,
+        use_momentum = True
+    ):
+        super().__init__()
+        self.net_rgb = net_rgb
+        self.net_flow = net_flow
+
+        self.online_encoder_rgb = NetWrapper(net_rgb, projection_size, projection_hidden_size, layer=hidden_layer)
+        self.online_encoder_flow = NetWrapper(net_flow, projection_size, projection_hidden_size, layer=hidden_layer)
+
+        self.use_momentum = use_momentum
+        self.target_encoder_rgb = None
+        self.target_encoder_flow = None
+        self.target_ema_updater = EMA(moving_average_decay)
+
+        self.online_predictor_rgb = MLP(projection_size, projection_size, projection_hidden_size)
+        self.online_predictor_flow = MLP(projection_size, projection_size, projection_hidden_size)
+
+        # get device of network and make wrapper same device
+        device = get_module_device(net_rgb)
+        self.to(device)
+
+        # send a mock image tensor to instantiate singleton parameters
+        throwaway_sample = {'rgb': torch.randn(2, 3, 15, image_size, image_size, device=device) , 'flow':torch.randn(2, 3, 16, image_size, image_size, device=device)}
+        self.forward(throwaway_sample)
+
+    @singleton('target_encoder_rgb')
+    def _get_target_encoder_rgb(self):
+        target_encoder_rgb = copy.deepcopy(self.online_encoder_rgb)
+        set_requires_grad(target_encoder_rgb, False)
+        return target_encoder_rgb
+    
+    @singleton('target_encoder_flow')
+    def _get_target_encoder_flow(self):
+        target_encoder_flow = copy.deepcopy(self.online_encoder_flow)
+        set_requires_grad(target_encoder_flow, False)
+        return target_encoder_flow
+
+    def reset_moving_average(self):
+        del self.target_encoder_rgb
+        self.target_encoder_rgb = None
+        del self.target_encoder_flow
+        self.target_encoder_flow = None
+
+    def update_moving_average(self):
+        assert self.use_momentum, 'you do not need to update the moving average, since you have turned off momentum for the target encoder'
+        assert self.target_encoder_rgb is not None, 'target rgb encoder has not been created yet'
+        assert self.target_encoder_flow is not None, 'target flow encoder has not been created yet'
+        update_moving_average(self.target_ema_updater, self.target_encoder_rgb, self.online_encoder_rgb)
+        update_moving_average(self.target_ema_updater, self.target_encoder_flow, self.online_encoder_flow)
+
+    def forward(
+        self,
+        sample,
+        return_embedding = False,
+        return_projection = True
+    ):
+        rgb, flow = sample['rgb'], sample['flow']
+        assert not (self.training and rgb.shape[0] == 1), 'you must have greater than 1 sample when training, due to the batchnorm in the projection layer'
+
+        if return_embedding:
+            return self.online_encoder_rgb(rgb, return_projection = return_projection), self.online_encoder_flow(flow, return_projection = return_projection) 
+
+        online_proj_rgb, _ = self.online_encoder_rgb(rgb)
+        online_proj_flow, _ = self.online_encoder_flow(flow)
+
+        online_pred_rgb = self.online_predictor_rgb(online_proj_rgb)
+        online_pred_flow = self.online_predictor_flow(online_proj_flow)
+
+        with torch.no_grad():
+            target_encoder_rgb = None
+            target_encoder_flow = None
+            if self.use_momentum:
+                target_encoder_rgb = self._get_target_encoder_rgb() 
+                target_encoder_flow = self._get_target_encoder_flow()
+            else: 
+                target_encoder_rgb = self.online_encoder_rgb
+                target_encoder_flow = self.online_encoder_flow
+            target_proj_rgb, _ = target_encoder_rgb(rgb)
+            target_proj_flow, _ = target_encoder_flow(flow)
+            target_proj_rgb.detach_()
+            target_proj_flow.detach_()
+        loss_rgb = loss_fn(online_pred_rgb, target_proj_flow.detach())
+        loss_flow = loss_fn(online_pred_flow, target_proj_rgb.detach())
+        loss_rgb = torch.mean(loss_rgb)
+        loss_flow = torch.mean(loss_flow)
+        return loss_rgb, loss_flow
